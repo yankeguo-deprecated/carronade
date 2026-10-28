@@ -1,16 +1,17 @@
-// +build windows
-// +build !appengine
+//go:build windows && !appengine
+// +build windows,!appengine
 
 package colorable
 
 import (
 	"bytes"
+	syscall "golang.org/x/sys/windows"
 	"io"
 	"math"
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"unsafe"
 
 	"github.com/mattn/go-isatty"
@@ -27,6 +28,7 @@ const (
 	backgroundRed       = 0x40
 	backgroundIntensity = 0x80
 	backgroundMask      = (backgroundRed | backgroundBlue | backgroundGreen | backgroundIntensity)
+	commonLvbUnderscore = 0x8000
 
 	cENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
 )
@@ -71,7 +73,7 @@ type consoleCursorInfo struct {
 }
 
 var (
-	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
+	kernel32                       = syscall.NewLazySystemDLL("kernel32.dll")
 	procGetConsoleScreenBufferInfo = kernel32.NewProc("GetConsoleScreenBufferInfo")
 	procSetConsoleTextAttribute    = kernel32.NewProc("SetConsoleTextAttribute")
 	procSetConsoleCursorPosition   = kernel32.NewProc("SetConsoleCursorPosition")
@@ -85,17 +87,19 @@ var (
 	procCreateConsoleScreenBuffer  = kernel32.NewProc("CreateConsoleScreenBuffer")
 )
 
-// Writer provides colorable Writer to the console
-type Writer struct {
+// writer provides colorable Writer to the console
+type writer struct {
 	out       io.Writer
 	handle    syscall.Handle
 	althandle syscall.Handle
 	oldattr   word
+	curattr   word
 	oldpos    coord
 	rest      bytes.Buffer
+	mutex     sync.Mutex
 }
 
-// NewColorable returns new instance of Writer which handles escape sequence from File.
+// NewColorable returns new instance of writer which handles escape sequence from File.
 func NewColorable(file *os.File) io.Writer {
 	if file == nil {
 		panic("nil passed instead of *os.File to NewColorable()")
@@ -109,17 +113,17 @@ func NewColorable(file *os.File) io.Writer {
 		var csbi consoleScreenBufferInfo
 		handle := syscall.Handle(file.Fd())
 		procGetConsoleScreenBufferInfo.Call(uintptr(handle), uintptr(unsafe.Pointer(&csbi)))
-		return &Writer{out: file, handle: handle, oldattr: csbi.attributes, oldpos: coord{0, 0}}
+		return &writer{out: file, handle: handle, oldattr: csbi.attributes, curattr: csbi.attributes, oldpos: coord{0, 0}}
 	}
 	return file
 }
 
-// NewColorableStdout returns new instance of Writer which handles escape sequence for stdout.
+// NewColorableStdout returns new instance of writer which handles escape sequence for stdout.
 func NewColorableStdout() io.Writer {
 	return NewColorable(os.Stdout)
 }
 
-// NewColorableStderr returns new instance of Writer which handles escape sequence for stderr.
+// NewColorableStderr returns new instance of writer which handles escape sequence for stderr.
 func NewColorableStderr() io.Writer {
 	return NewColorable(os.Stderr)
 }
@@ -431,9 +435,15 @@ func atoiWithDefault(s string, def int) (int, error) {
 }
 
 // Write writes data on console
-func (w *Writer) Write(data []byte) (n int, err error) {
+func (w *writer) Write(data []byte) (n int, err error) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
 	var csbi consoleScreenBufferInfo
-	procGetConsoleScreenBufferInfo.Call(uintptr(w.handle), uintptr(unsafe.Pointer(&csbi)))
+
+	if w.rest.Len() == 0 && bytes.IndexByte(data, 0x1b) == -1 {
+		w.out.Write(data)
+		return len(data), nil
+	}
 
 	handle := w.handle
 
@@ -447,17 +457,21 @@ func (w *Writer) Write(data []byte) (n int, err error) {
 	} else {
 		er = bytes.NewReader(data)
 	}
-	var bw [1]byte
+	var plaintext bytes.Buffer
 loop:
 	for {
 		c1, err := er.ReadByte()
 		if err != nil {
+			plaintext.WriteTo(w.out)
 			break loop
 		}
 		if c1 != 0x1b {
-			bw[0] = c1
-			w.out.Write(bw[:])
+			plaintext.WriteByte(c1)
 			continue
+		}
+		_, err = plaintext.WriteTo(w.out)
+		if err != nil {
+			break loop
 		}
 		c2, err := er.ReadByte()
 		if err != nil {
@@ -508,7 +522,7 @@ loop:
 				w.rest.Reset()
 				break
 			}
-			buf.Write([]byte(string(c)))
+			buf.WriteByte(c)
 		}
 		if m == 0 {
 			break loop
@@ -551,7 +565,7 @@ loop:
 			}
 			procSetConsoleCursorPosition.Call(uintptr(handle), *(*uintptr)(unsafe.Pointer(&csbi.cursorPosition)))
 		case 'E':
-			n, err = strconv.Atoi(buf.String())
+			n, err = atoiWithDefault(buf.String(), 1)
 			if err != nil {
 				continue
 			}
@@ -560,7 +574,7 @@ loop:
 			csbi.cursorPosition.y += short(n)
 			procSetConsoleCursorPosition.Call(uintptr(handle), *(*uintptr)(unsafe.Pointer(&csbi.cursorPosition)))
 		case 'F':
-			n, err = strconv.Atoi(buf.String())
+			n, err = atoiWithDefault(buf.String(), 1)
 			if err != nil {
 				continue
 			}
@@ -669,11 +683,11 @@ loop:
 			procFillConsoleOutputCharacter.Call(uintptr(handle), uintptr(' '), uintptr(n), *(*uintptr)(unsafe.Pointer(&cursor)), uintptr(unsafe.Pointer(&written)))
 			procFillConsoleOutputAttribute.Call(uintptr(handle), uintptr(csbi.attributes), uintptr(n), *(*uintptr)(unsafe.Pointer(&cursor)), uintptr(unsafe.Pointer(&written)))
 		case 'm':
-			procGetConsoleScreenBufferInfo.Call(uintptr(handle), uintptr(unsafe.Pointer(&csbi)))
-			attr := csbi.attributes
+			attr := w.curattr
 			cs := buf.String()
 			if cs == "" {
 				procSetConsoleTextAttribute.Call(uintptr(handle), uintptr(w.oldattr))
+				w.curattr = w.oldattr
 				continue
 			}
 			token := strings.Split(cs, ";")
@@ -683,14 +697,19 @@ loop:
 					switch {
 					case n == 0 || n == 100:
 						attr = w.oldattr
-					case 1 <= n && n <= 5:
+					case n == 4:
+						attr |= commonLvbUnderscore
+					case (1 <= n && n <= 3) || n == 5:
 						attr |= foregroundIntensity
-					case n == 7:
-						attr = ((attr & foregroundMask) << 4) | ((attr & backgroundMask) >> 4)
-					case n == 22 || n == 25:
-						attr |= foregroundIntensity
-					case n == 27:
-						attr = ((attr & foregroundMask) << 4) | ((attr & backgroundMask) >> 4)
+					case n == 7 || n == 27:
+						attr =
+							(attr &^ (foregroundMask | backgroundMask)) |
+								((attr & foregroundMask) << 4) |
+								((attr & backgroundMask) >> 4)
+					case n == 22:
+						attr &^= foregroundIntensity
+					case n == 24:
+						attr &^= commonLvbUnderscore
 					case 30 <= n && n <= 37:
 						attr &= backgroundMask
 						if (n-30)&1 != 0 {
@@ -709,7 +728,7 @@ loop:
 									n256setup()
 								}
 								attr &= backgroundMask
-								attr |= n256foreAttr[n256]
+								attr |= n256foreAttr[n256%len(n256foreAttr)]
 								i += 2
 							}
 						} else if len(token) == 5 && token[i+1] == "2" {
@@ -751,7 +770,7 @@ loop:
 									n256setup()
 								}
 								attr &= foregroundMask
-								attr |= n256backAttr[n256]
+								attr |= n256backAttr[n256%len(n256backAttr)]
 								i += 2
 							}
 						} else if len(token) == 5 && token[i+1] == "2" {
@@ -800,8 +819,11 @@ loop:
 							attr |= backgroundBlue
 						}
 					}
-					procSetConsoleTextAttribute.Call(uintptr(handle), uintptr(attr))
 				}
+			}
+			if attr != w.curattr {
+				procSetConsoleTextAttribute.Call(uintptr(handle), uintptr(attr))
+				w.curattr = attr
 			}
 		case 'h':
 			var ci consoleCursorInfo
@@ -820,6 +842,8 @@ loop:
 					w.althandle = syscall.Handle(h)
 					if w.althandle != 0 {
 						handle = w.althandle
+						procGetConsoleScreenBufferInfo.Call(uintptr(handle), uintptr(unsafe.Pointer(&csbi)))
+						w.curattr = csbi.attributes
 					}
 				}
 			}
@@ -839,6 +863,8 @@ loop:
 					syscall.CloseHandle(w.althandle)
 					w.althandle = 0
 					handle = w.handle
+					procGetConsoleScreenBufferInfo.Call(uintptr(handle), uintptr(unsafe.Pointer(&csbi)))
+					w.curattr = csbi.attributes
 				}
 			}
 		case 's':
